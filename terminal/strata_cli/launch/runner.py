@@ -1010,6 +1010,7 @@ class Runner:
                     self.emit("engine", str(ev.get("message") or ""))
             last = ev
         code = p.wait()
+        self.forget_engine_report()        # whatever this run downloaded is the engine now: the screens ask again
         if stale:
             # an engine is there and was too old: warn, never refuse (round 8, M: 0.1.45.3 was reused although 0.1.47 existed, and Gyro-S failed
             # on kernels only the newer engine has). Whatever the update did, say where it stands.
@@ -1045,6 +1046,17 @@ class Runner:
                               "Check your internet connection, or point Strata at an update source with --feed, then try again.", 6)
         self.engine_fresh = True                             # fetched in this run: a Mac builds its graphics code on the first answer (T22)
         self.emit("engine", "The engine is installed.", 100)
+
+    def forget_engine_report(self) -> None:
+        """Tell the catalog to ask again which engine is installed. The launch screens ask on every repaint and keep the answer;
+        a stand-in catalog that knows nothing about it is not a reason to stop a run."""
+        forget = getattr(self._catalog, "forget_engine_report", None)
+        if forget is None:
+            return
+        try:
+            forget()
+        except Exception:                                    # noqa: BLE001 - only the screens lose their kept answer
+            pass
 
     def stale_update_blocked(self, stale: str) -> str | None:
         """The engine here is older than this model needs. Updating it is the person's choice (owner, 11-01: an engine update never starts by itself):

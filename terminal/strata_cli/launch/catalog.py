@@ -357,6 +357,8 @@ class Catalog:
         self._mcp_data_dir = self.strata.data_dir
         self.strata.data_dir = self.data_dir          # one answer to "where is the data folder" for every caller, the app's included
         self._hardware_override = hardware
+        self._engine_report: dict | None = None      # what is installed, asked once: see engine_report
+        self._reader_state: str | None = None        # the same answer for the picture reader: see reader_state
 
     # ---- the computer
     def hardware(self, fresh: bool = False) -> dict:
@@ -402,16 +404,34 @@ class Catalog:
                         os=str(hw.get("os") or ""), avx2=(hw.get("cpu") or {}).get("avx2"), raw=hw,
                         engine_vendor=self.engine_vendor(hw))
 
+    # ---- what is installed
+    def engine_report(self, fresh: bool = False) -> dict:
+        """What engine this PC has, once per run: `engine_component.status()`, {} when it cannot answer. Every repaint of
+        the launch screens asked it who is installed - twice or three times a paint - and status() reads every engine
+        package on the PC, which is what made the parameter screen lag. Nothing else changes the answer while the
+        screens are open, so it is kept; `forget_engine_report` drops it after an engine is installed."""
+        if fresh or self._engine_report is None:
+            try:
+                from strata_control import engine_component as ec
+                self._engine_report = ec.status()
+            except Exception:                                    # noqa: BLE001 - no report is the same answer as no engine
+                self._engine_report = {}
+        return self._engine_report
+
+    def forget_engine_report(self) -> None:
+        """Ask again what is installed: the Runner calls this after it fetched an engine mid-run."""
+        self._engine_report = None
+        self._reader_state = None
+
+    def engine_exe(self) -> str | None:
+        """The installed engine's program, None when there is none to start."""
+        rep = self.engine_report()
+        return (rep.get("engine") or {}).get("exe") if rep.get("usable") else None
+
     def installed_backend(self) -> str | None:
         """The installed engine's backend (cuda, hip, sycl, cpu, metal), None when there is no usable engine yet."""
-        try:
-            from strata_control import engine_component as ec
-            rep = ec.status()
-            if rep.get("usable"):
-                return (rep.get("engine") or {}).get("backend")
-        except Exception:                                    # noqa: BLE001
-            pass
-        return None
+        rep = self.engine_report()
+        return (rep.get("engine") or {}).get("backend") if rep.get("usable") else None
 
     def engine_vendor(self, hw: dict | None = None) -> str | None:
         """The make of card the engine drives: the installed engine's; with none installed, the engine setup would fetch (NVIDIA first when the
@@ -610,18 +630,16 @@ class Catalog:
 
     def reader_state(self) -> str:
         """"present" when the installed engine carries the picture reader (strata-vision), "missing" when an engine is installed without it,
-        "unknown" before any engine is installed (the first launch fetches one that has it)."""
-        try:
-            from strata_control import engine_component as ec
-            rep = ec.status()
-            exe = (rep.get("engine") or {}).get("exe") if rep.get("usable") else None
-        except Exception:                                    # noqa: BLE001
-            exe = None
-        if not exe:
-            return "unknown"
-        from strata_control import vision_reader as VR
-        found = VR.find(Path(str(exe)).parent, os.name == "nt")
-        return "present" if (found["cpu"] or found["gpu"]) else "missing"
+        "unknown" before any engine is installed (the first launch fetches one that has it). Kept once per run, like engine_report."""
+        if self._reader_state is None:
+            exe = self.engine_exe()
+            if not exe:
+                self._reader_state = "unknown"
+            else:
+                from strata_control import vision_reader as VR
+                found = VR.find(Path(str(exe)).parent, os.name == "nt")
+                self._reader_state = "present" if (found["cpu"] or found["gpu"]) else "missing"
+        return self._reader_state
 
     def picture_default(self, images: bool) -> str:
         """The picture setting nobody chose: off for a model that cannot read pictures or an engine without the reader; else on, with the

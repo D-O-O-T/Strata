@@ -44,9 +44,10 @@ import os
 import time
 import re
 import shutil
+import stat
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from strata_control import acquisition, longpath
@@ -383,6 +384,14 @@ def signing_payload(manifest: dict) -> bytes:
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+#: Which manifest payloads this process has already checked a signature over, and what it concluded. The check is
+#: Ed25519 maths over the manifest bytes - 14 ms a package here - and the launch screens ask who is installed on every
+#: repaint. The same bytes under the same key answer the same way; a rewritten manifest is other bytes and is checked
+#: again. What the PC requires (``STRATA_REQUIRE_SIGNED_COMPONENTS``) and which verifier answers are part of the key, so
+#: turning the requirement on, or a verifier registered later, asks again. Only "verified" is kept: a refusal stays a refusal to re-check.
+_SIGNATURE_OK: dict = {}
+
+
 def verify_signature(component: "EngineComponent", environ=None) -> str:
     """"verified", "unsigned" or "unverified" (signed, no verifier yet). Raises IntegrityProblem for a bad signature,
     and for an unsigned or unverifiable package when ``STRATA_REQUIRE_SIGNED_COMPONENTS`` is set."""
@@ -404,12 +413,19 @@ def verify_signature(component: "EngineComponent", environ=None) -> str:
         if required:
             raise IntegrityProblem("the package is signed but this build cannot check signatures yet")
         return "unverified"
+    payload = signing_payload(component.raw)
+    key = (hashlib.sha256(payload).hexdigest(), json.dumps(component.signature, sort_keys=True), required, _verifier)
+    if key in _SIGNATURE_OK:
+        return _SIGNATURE_OK[key]                       # these very bytes verified a moment ago (see _SIGNATURE_OK)
     try:
-        _verifier(signing_payload(component.raw), component.signature, component)
+        _verifier(payload, component.signature, component)
     except IntegrityProblem:
         raise
     except Exception as exc:
         raise IntegrityProblem(f"the signature does not verify ({type(exc).__name__}: {exc})") from None
+    _SIGNATURE_OK[key] = "verified"
+    while len(_SIGNATURE_OK) > 24:
+        _SIGNATURE_OK.pop(next(iter(_SIGNATURE_OK)), None)
     return "verified"
 
 
@@ -444,6 +460,32 @@ def _hash_settled(path: Path, digest: str) -> str | None:
 _HASHED_OK: set = set()
 
 
+#: Each subfolder of an engine package, resolved once rather than once per file. The quick integrity check used to
+#: resolve every listed file: the HIP engine lists 415, so a status report walked the tree 1 245 times, 45 ms per package,
+#: on every repaint of the launch screens. A folder is stated again on every check, so a folder replaced by a link to
+#: somewhere else is not the folder this table knows, and the file is resolved in full as before.
+_FOLDERS_RESOLVED: dict = {}
+
+
+def _folder_resolved(folder: Path) -> Path | None:
+    """The folder with its links followed, or None when it is not a plain directory: then the caller resolves the file
+    itself, exactly as before. Kept for a folder nobody changed (a change inside it moves its modification time)."""
+    try:
+        info = folder.lstat()
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return None
+    key = (str(folder), info.st_size, info.st_mtime_ns)
+    kept = _FOLDERS_RESOLVED.get(key)
+    if kept is None:
+        kept = folder.resolve()
+        while len(_FOLDERS_RESOLVED) > 64:
+            _FOLDERS_RESOLVED.pop(next(iter(_FOLDERS_RESOLVED)), None)     # the folder kept longest, from a package nobody lists again
+        _FOLDERS_RESOLVED[key] = kept
+    return kept
+
+
 def verify(component: EngineComponent, *, full: bool = False) -> None:
     """Raise IntegrityProblem unless the files are what the manifest says. `full` hashes every file; without it only
     the entrypoint is hashed (sizes are always checked), once per file as it is on disk (see _HASHED_OK)."""
@@ -451,15 +493,20 @@ def verify(component: EngineComponent, *, full: bool = False) -> None:
     # reports as "missing" for an ordinary path
     folder = longpath.long_path(component.root)
     root = folder.resolve()
+    parents: dict[Path, Path | None] = {}       # every subfolder the list reaches, resolved once for this check (see _FOLDERS_RESOLVED)
     for rel, digest, size in component.files:
         target = folder / rel
         try:
             info = target.lstat()
         except OSError:
             raise IntegrityProblem(f"{rel} is missing") from None
-        if target.is_symlink() or not target.is_file():
-            raise IntegrityProblem(f"{rel} is not a regular file")
-        if not longpath.same_tree(target.resolve(), root):
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise IntegrityProblem(f"{rel} is not a regular file")     # the lstat above already says this: no second stat per file
+        parent = target.parent
+        if parent not in parents:
+            parents[parent] = _folder_resolved(parent)
+        kept = parents[parent]
+        if not longpath.same_tree(kept if kept is not None else target.resolve(), root):
             raise IntegrityProblem(f"{rel} resolves outside the component folder")
         if info.st_size != size:
             raise IntegrityProblem(f"{rel} is {info.st_size} bytes, the manifest says {size}")
@@ -539,10 +586,46 @@ def save_backend(value, environ=None) -> Path | None:
     return path
 
 
+#: One probe answer per process, keyed by what could change it (see detect_backend). Every repaint of the launch screens
+#: asked which engine family this PC needs: 33 ms here (rocminfo), and a GPU tool that hangs is asked its 8 s
+#: timeout again each time. The make of card a computer has does not change inside a command, as with _CIM_CACHE (#4975).
+_BACKEND_CACHE: dict = {}
+BACKEND_CACHE_SECONDS = 120.0     # an answer (a failed one too) serves every caller of this process for this long
+BACKEND_MISS_SECONDS = 15.0       # nothing answered: asked again soon, a driver service can start after the first look
+
+
 def detect_backend(environ=None) -> tuple[str | None, str]:
     """(backend, how) for this machine: the engine family its GPU needs. Bounded, read-only probes of tools that are
-    already installed; ``STRATA_ENGINE_BACKEND`` overrides (the tests and the support desk use it)."""
-    environ = os.environ if environ is None else environ
+    already installed; ``STRATA_ENGINE_BACKEND`` overrides (the tests and the support desk use it). The probes are asked
+    once per process: an answer stands for BACKEND_CACHE_SECONDS, a silence for BACKEND_MISS_SECONDS, and another
+    ``STRATA_ENGINE_BACKEND`` or saved choice asks again. A caller that names its own `environ` always probes."""
+    if environ is not None:
+        return _detect_backend(environ)
+    now = time.monotonic()
+    key = _backend_probe_key(os.environ)
+    hit = _BACKEND_CACHE.get(key)
+    if hit is not None and now - hit[0] < hit[2]:
+        return hit[1]
+    answer = _detect_backend(os.environ)
+    _BACKEND_CACHE[key] = (now, answer, BACKEND_CACHE_SECONDS if answer[0] else BACKEND_MISS_SECONDS)
+    while len(_BACKEND_CACHE) > 16:                   # a process sees a handful of keys; the table stays small whatever it is fed
+        _BACKEND_CACHE.pop(min(_BACKEND_CACHE, key=lambda k: _BACKEND_CACHE[k][0]), None)
+    return answer
+
+
+def forget_detected_backend() -> None:
+    """Drop the kept probe answers: after a card was added, or between the cases of a test."""
+    _BACKEND_CACHE.clear()
+
+
+def _backend_probe_key(environ) -> tuple:
+    """What can change the answer without changing the computer: the platform, the family the environment forces (its
+    variant included: "hip-rx6000" picks a different package than "hip"), the saved choice."""
+    return (host_platform(), str(environ.get(ENV_BACKEND) or "").strip().lower(), saved_backend(environ))
+
+
+def _detect_backend(environ) -> tuple[str | None, str]:
+    """The probes themselves, asked now."""
     forced = split_backend(environ.get(ENV_BACKEND, ""))[0]      # "hip-rdna2" starts the hip family (the package choice reads the variant)
     if forced:
         if forced not in BACKEND_MATRIX:
@@ -1038,20 +1121,53 @@ def arch_native(archs, present: list[str]) -> bool:
 
 # ----------------------------------------------------------------------------------------------- resolve
 
+#: What a folder held the last time it was read, keyed by the name, size and modification time of every manifest in it
+#: . status() scans the folder twice over (once for the listing, once inside resolve()) and a PC that keeps three
+#: engine folders reads three manifests, some 130 file entries and about 2 500 path checks, on every repaint of the
+#: launch screens - 20 ms per scan even when nothing changed. Stating a manifest is a stat, so a folder nobody touched
+#: answers from the last read; adding, removing or rewriting a package changes the key.
+_SCAN_CACHE: dict = {}
+
+
+def _manifest_stamp(entry: Path) -> tuple:
+    """(size, mtime_ns) of a folder's manifest, (None, None) when there is none to state: what `scan` keys its reading on."""
+    try:
+        info = (entry / MANIFEST).stat()
+        return (info.st_size, info.st_mtime_ns)
+    except OSError:
+        return (None, None)
+
+
 def scan(root: Path | None = None, component_id: str = COMPONENT_ID) -> tuple[list[EngineComponent], list[dict]]:
-    """Every readable engine package in the folder, and the ones that were not (with the reason). `component_id`: see read_manifest."""
+    """Every readable engine package in the folder, and the ones that were not (with the reason). `component_id`: see read_manifest.
+    A folder nobody changed answers from the last read (see _SCAN_CACHE); the answer is copied, so a caller's edit never
+    reaches the next one."""
     folder = engine_dir(root)
-    found, problems = [], []
     try:
         entries = sorted(item for item in folder.iterdir() if item.is_dir() and not item.name.startswith("."))
     except OSError:
         return [], []
-    for entry in entries[:64]:
+    entries = entries[:64]
+    key = (str(folder), component_id, tuple((item.name, *_manifest_stamp(item)) for item in entries))
+    kept = _SCAN_CACHE.get(key)
+    if kept is not None:
+        return [replace(item) for item in kept[0]], [dict(problem) for problem in kept[1]]
+    found, problems = [], []
+    for entry in entries:
         try:
             found.append(read_manifest(entry, component_id))
         except ComponentProblem as exc:
             problems.append({"folder": str(entry), "problem": str(exc)})
+    if found:                                             # an empty folder says nothing worth keeping
+        _SCAN_CACHE[key] = (found, problems)
+        while len(_SCAN_CACHE) > 12:
+            _SCAN_CACHE.pop(min(_SCAN_CACHE, key=lambda k: len(k[2])), None)     # the folder with the fewest packages is the one nobody lists again
     return found, problems
+
+
+def forget_scanned_folders() -> None:
+    """Drop the kept engine listings: after a package was installed or removed, or between the cases of a test."""
+    _SCAN_CACHE.clear()
 
 
 def driver_notice(have: str | None, need: str) -> str:

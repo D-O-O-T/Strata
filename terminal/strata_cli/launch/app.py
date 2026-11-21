@@ -290,12 +290,7 @@ class Ctx:
             return None
 
     def engine_exe(self) -> str | None:
-        try:
-            from strata_control import engine_component as ec
-            rep = ec.status()
-            return (rep.get("engine") or {}).get("exe") if rep.get("usable") else None
-        except Exception:                                    # noqa: BLE001
-            return None
+        return self.catalog.engine_exe()        # asked once per run, kept by the catalog
 
     # ---- where the model is and what it still needs
     def model_state(self, data_dir: str | None = None):
